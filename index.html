@@ -408,13 +408,23 @@ async function doLogin() {
   err.textContent = '';
 
   const url = getWorkerUrl();
+  const requestLogin = (baseUrl) => fetch(`${baseUrl}/api/login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email, password: pass }),
+  });
 
   try {
-    const res  = await fetch(`${url}/api/login`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email, password: pass }),
-    });
+    let res;
+    try {
+      res = await requestLogin(url);
+    } catch (primaryError) {
+      // A saved URL can outlive a backend migration. Retry through the
+      // production proxy before reporting a network failure to the user.
+      if (url === DEFAULT_URL) throw primaryError;
+      res = await requestLogin(DEFAULT_URL);
+      localStorage.setItem('gcoin_url', DEFAULT_URL);
+    }
     const data = await res.json();
     if (data.ok) {
       setSession({ email, key: data.key, isAdmin: data.isAdmin === true });
