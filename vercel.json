@@ -1,0 +1,13 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "rewrites": [
+    {
+      "source": "/",
+      "destination": "https://gcoin-api.verifmlbb629.workers.dev/"
+    },
+    {
+      "source": "/:path*",
+      "destination": "https://gcoin-api.verifmlbb629.workers.dev/:path*"
+    }
+  ]
+}
