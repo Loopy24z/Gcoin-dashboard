@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Saweria Dashboard</title>
+  <title>GCoin Dashboard</title>
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     :root {
@@ -180,8 +180,8 @@
 <div class="auth-wrap" id="authWrap">
   <div class="auth-card">
     <div class="auth-logo">
-      <h1>🎮 Saweria Dashboard</h1>
-      <p>Login untuk kelola donasi Roblox</p>
+      <h1>🎮 GCoin Dashboard</h1>
+      <p>Login untuk kelola GCoin</p>
     </div>
     <div class="form-group">
       <label>Email</label>
@@ -199,7 +199,7 @@
 <!-- ── APP ── -->
 <div class="app" id="app">
   <div class="header">
-    <div class="header-title">🎮 Saweria Dashboard</div>
+    <div class="header-title">🎮 GCoin Dashboard</div>
     <span class="header-user" id="headerUser"></span>
     <div class="header-actions">
       <span class="refresh-info" id="refreshInfo"></span>
@@ -244,11 +244,11 @@
           <div class="info-val" id="infoKey">—</div>
         </div>
         <div class="info-card">
-          <div class="info-lbl">Webhook URL (Saweria)</div>
+          <div class="info-lbl">Webhook URL (GCoin)</div>
           <div class="info-val" id="infoWebhook" style="font-size:0.74rem">—</div>
         </div>
         <div class="info-card">
-          <div class="info-lbl">Queue URL (Roblox)</div>
+          <div class="info-lbl">Queue URL (GCoin)</div>
           <div class="info-val" id="infoQueue" style="font-size:0.74rem">—</div>
         </div>
       </div>
@@ -312,7 +312,7 @@
       <p class="section-desc">
         Atur tingkat donasi — nama, jumlah minimum (Rp), level, efek, dan warna.<br>
         Klik <b>Simpan ke Worker</b> agar tersimpan permanen dan dipakai saat donasi masuk.<br>
-        Klik <b>Salin Kode Roblox</b> lalu paste ke script Roblox Studio kamu.
+        Klik <b>Salin Kode GCoin</b> lalu paste ke script server kamu.
       </p>
 
       <!-- Effect Triggers -->
@@ -330,7 +330,7 @@
         <button class="btn-add-tier" onclick="addTier()">+ Tambah Tingkat</button>
         <div class="save-row" style="flex-wrap:wrap;gap:8px">
           <button class="btn accent" onclick="saveTiers()">💾 Simpan ke Worker</button>
-          <button class="btn" onclick="copyLuaCode()">📋 Salin Kode Roblox</button>
+          <button class="btn" onclick="copyLuaCode()">📋 Salin Kode GCoin</button>
           <span class="save-ok" id="tierOk">✓ Tersimpan</span>
           <span class="save-ok" id="copyOk">✓ Kode disalin!</span>
         </div>
@@ -386,7 +386,7 @@
 
 <script>
 // ── Constants ──────────────────────────────────────────────────────────
-const DEFAULT_URL = 'https://roblox-api-donation.verifmlbb629.workers.dev';
+const DEFAULT_URL = 'https://gcoin-api.verifmlbb629.workers.dev';
 
 // ── Auth ───────────────────────────────────────────────────────────────
 function getSession() {
@@ -442,13 +442,13 @@ function doLogout() {
 
 // ── Config ─────────────────────────────────────────────────────────────
 function getWorkerUrl() {
-  return (localStorage.getItem('sw_url') || DEFAULT_URL).replace(/\/$/, '');
+  return (localStorage.getItem('gcoin_url') || DEFAULT_URL).replace(/\/$/, '');
 }
 
 function saveCfg() {
   const u = document.getElementById('cfgUrl').value.trim().replace(/\/$/, '');
   const k = document.getElementById('cfgKey').value.trim();
-  if (u) localStorage.setItem('sw_url', u);
+  if (u) localStorage.setItem('gcoin_url', u);
   if (k) {
     const s = getSession();
     if (s) { s.key = k; setSession(s); }
@@ -896,7 +896,7 @@ async function refreshAll() {
     renderLeaderboard(lb);
     document.getElementById('lbUpdate').textContent = now;
 
-    // All-time total comes from the worker (survives the 100-donation cap).
+    // All-time total comes from the worker (survives the 100-record cap).
     // Fallback to summing the board if the worker isn't updated yet.
     const totalAmt = typeof lbResp.total === 'number'
       ? lbResp.total
