@@ -85,8 +85,6 @@
     .td-muted { color: var(--text-muted); font-size: 0.79rem; }
     .td-amt { font-weight: 600; color: var(--accent); }
     .td-msg { color: var(--text-muted); font-size: 0.79rem; max-width: 220px; }
-    .status-ok { display: inline-block; padding: 2px 7px; border-radius: 4px; font-size: 0.71rem; font-weight: 600; background: rgba(34,197,94,.15); color: #22c55e; }
-    .status-pend { display: inline-block; padding: 2px 7px; border-radius: 4px; font-size: 0.71rem; font-weight: 600; background: rgba(245,158,11,.15); color: #f59e0b; }
     .rank-badge { display: inline-flex; align-items: center; justify-content: center; width: 24px; height: 24px; border-radius: 6px; font-size: 0.75rem; font-weight: 700; }
     .r1 { background: rgba(251,191,36,.2); color: #fbbf24; }
     .r2 { background: rgba(148,163,184,.2); color: #94a3b8; }
@@ -264,8 +262,8 @@
         </div>
         <div class="tbl-scroll">
           <table>
-            <thead><tr><th>Waktu</th><th>Donor</th><th>Amount</th><th>Status</th><th>Tingkat</th><th>Pesan</th></tr></thead>
-            <tbody id="dashTbody"><tr><td class="empty-td" colspan="6">Memuat…</td></tr></tbody>
+            <thead><tr><th>Waktu</th><th>Donor</th><th>Amount</th><th>Tingkat</th><th>Pesan</th></tr></thead>
+            <tbody id="dashTbody"><tr><td class="empty-td" colspan="5">Memuat…</td></tr></tbody>
           </table>
         </div>
       </div>
@@ -284,8 +282,8 @@
         </div>
         <div class="tbl-scroll" style="max-height:520px;overflow-y:auto;">
           <table>
-            <thead style="position:sticky;top:0;z-index:1;background:var(--surface2);"><tr><th>Waktu</th><th>Donor</th><th>Amount</th><th>Status</th><th>Tingkat</th><th>Pesan</th><th>Aksi</th></tr></thead>
-            <tbody id="histTbody"><tr><td class="empty-td" colspan="7">Memuat…</td></tr></tbody>
+            <thead style="position:sticky;top:0;z-index:1;background:var(--surface2);"><tr><th>Waktu</th><th>Donor</th><th>Amount</th><th>Tingkat</th><th>Pesan</th><th>Aksi</th></tr></thead>
+            <tbody id="histTbody"><tr><td class="empty-td" colspan="6">Memuat…</td></tr></tbody>
           </table>
         </div>
       </div>
@@ -300,8 +298,8 @@
         </div>
         <div class="tbl-scroll">
           <table>
-            <thead><tr><th>#</th><th>Donor</th><th>Total</th><th>Tingkat</th></tr></thead>
-            <tbody id="lbTbody"><tr><td class="empty-td" colspan="4">Memuat…</td></tr></tbody>
+            <thead><tr><th>#</th><th>Donor</th><th>Total</th><th>Tingkat</th><th>Aksi</th></tr></thead>
+            <tbody id="lbTbody"><tr><td class="empty-td" colspan="5">Memuat…</td></tr></tbody>
           </table>
         </div>
       </div>
@@ -386,7 +384,11 @@
 
 <script>
 // ── Constants ──────────────────────────────────────────────────────────
-const DEFAULT_URL = 'https://sw-dashboard-mocha.vercel.app';
+// Both the Vercel deployment and the Worker itself serve this page and proxy
+// the same API paths, so the page's own origin is always the right default.
+// Hardcoding one host meant a saved URL outlived the backend it pointed at.
+const FALLBACK_URL = 'https://sw-dashboard-mocha.vercel.app';
+const DEFAULT_URL  = /^https?:$/.test(location.protocol) ? location.origin : FALLBACK_URL;
 
 // ── Auth ───────────────────────────────────────────────────────────────
 function getSession() {
@@ -419,13 +421,14 @@ async function doLogin() {
     try {
       res = await requestLogin(url);
     } catch (primaryError) {
-      // A saved URL can outlive a backend migration. Retry through the
-      // production proxy before reporting a network failure to the user.
+      // A saved URL can outlive the backend it pointed at. Retry through the
+      // origin this page was served from, which always proxies the API, and
+      // keep that as the new setting.
       if (url === DEFAULT_URL) throw primaryError;
       res = await requestLogin(DEFAULT_URL);
       localStorage.setItem('gcoin_url', DEFAULT_URL);
     }
-    const data = await res.json();
+    const data = await res.json().catch(() => ({ ok: false, error: `Jawaban tidak valid (HTTP ${res.status})` }));
     if (data.ok) {
       setSession({ email, key: data.key, isAdmin: data.isAdmin === true });
       document.getElementById('authWrap').style.display = 'none';
@@ -443,6 +446,7 @@ async function doLogin() {
 }
 
 function doLogout() {
+  stopAutoRefresh();
   clearSession();
   document.getElementById('authWrap').style.display = 'flex';
   document.getElementById('app').classList.remove('show');
@@ -458,10 +462,17 @@ function getWorkerUrl() {
 function saveCfg() {
   const u = document.getElementById('cfgUrl').value.trim().replace(/\/$/, '');
   const k = document.getElementById('cfgKey').value.trim();
+  // A typo here points the whole dashboard at a host that does not exist, and
+  // the only symptom was every panel failing at once.
+  if (u && !/^https?:\/\/[^\s/]+/.test(u)) {
+    alert('Worker Base URL harus dimulai dengan http:// atau https://');
+    return;
+  }
   if (u) localStorage.setItem('gcoin_url', u);
   if (k) {
     const s = getSession();
     if (s) { s.key = k; setSession(s); }
+    document.getElementById('cfgKey').value = '';
   }
   showOk('cfgOk');
   refreshAll();
@@ -506,20 +517,33 @@ function collectForm() {
 
 async function saveTiers() {
   const cfg = collectForm();
+  if (!cfg.tiers.length) { alert('Tambahkan minimal satu tingkat donasi.'); return; }
+
   localStorage.setItem('sw_tiers', JSON.stringify(cfg.tiers));
   localStorage.setItem('sw_fx',    JSON.stringify(cfg.effectMinRp));
   renderTiers(cfg.tiers);
   renderTierPreview(cfg.tiers);
-  // Simpan ke worker
+
+  // "✓ Tersimpan" used to appear even when the worker rejected or never
+  // received the config, so a tier table that only lived in localStorage looked
+  // saved while donations kept using the old levels.
+  const ok = document.getElementById('tierOk');
   try {
-    const sep = '/config'.includes('?') ? '&' : '?';
-    await fetch(`${baseUrl()}/config${sep}key=${encodeURIComponent(apiKey())}`, {
+    const res = await fetch(`${baseUrl()}/config?key=${encodeURIComponent(apiKey())}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(cfg),
     });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      throw new Error(data.error || `HTTP ${res.status}`);
+    }
+    ok.style.color = 'var(--success)';
+    ok.textContent = '✓ Tersimpan';
     showOk('tierOk');
-  } catch {
+  } catch (e) {
+    ok.style.color = 'var(--danger)';
+    ok.textContent = '✕ Gagal simpan ke worker: ' + e.message;
     showOk('tierOk');
   }
 }
@@ -565,13 +589,31 @@ local EFFECT_MIN_RP = {
 \tHammer    = ${fx.Hammer},
 }`;
 
-  navigator.clipboard.writeText(lua).then(() => showOk('copyOk'));
+  // clipboard.writeText is unavailable outside a secure context and the promise
+  // had no rejection handler, so a failed copy looked like nothing happened.
+  const done = (ok) => {
+    const el = document.getElementById('copyOk');
+    el.style.color   = ok ? 'var(--success)' : 'var(--danger)';
+    el.textContent   = ok ? '✓ Kode disalin!' : '✕ Gagal menyalin — kode dibuka di tab baru';
+    showOk('copyOk');
+    if (!ok) window.open('data:text/plain;charset=utf-8,' + encodeURIComponent(lua), '_blank');
+  };
+
+  if (navigator.clipboard?.writeText) {
+    navigator.clipboard.writeText(lua).then(() => done(true), () => done(false));
+  } else {
+    done(false);
+  }
 }
 
 function addTier() {
   const cur = collectForm().tiers;
   renderTiers([...cur, { name: 'Tier Baru', minRp: 0, level: 1, effect: 'Efek', color: '#6b7194' }]);
 }
+
+// Tier colours end up inside a style attribute, so anything that is not a plain
+// 6-digit hex is replaced rather than concatenated into CSS.
+const safeColor = c => /^#[0-9a-fA-F]{6}$/.test(String(c)) ? String(c) : '#6b7194';
 
 function renderTiers(tiers) {
   const list = document.getElementById('tierList');
@@ -581,31 +623,39 @@ function renderTiers(tiers) {
     d.className = 'tier-row';
     d.innerHTML = `
       <div><label>Nama</label><input class="form-input ti-name" value="${esc(t.name)}"></div>
-      <div><label>Min Rp</label><input type="number" class="form-input ti-minrp" value="${t.minRp}"></div>
-      <div><label>Level</label><input type="number" class="form-input ti-level" value="${t.level || 1}" style="width:70px"></div>
+      <div><label>Min Rp</label><input type="number" class="form-input ti-minrp" value="${Number(t.minRp) || 0}"></div>
+      <div><label>Level</label><input type="number" class="form-input ti-level" value="${Number(t.level) || 1}" style="width:70px"></div>
       <div><label>Efek</label><input class="form-input ti-effect" value="${esc(t.effect)}"></div>
-      <div><label>Warna</label><input type="color" class="form-input ti-color" value="${t.color}" style="padding:4px;height:36px"></div>
-      <div style="align-self:flex-end"><button class="btn-del" onclick="this.closest('.tier-row').remove()">✕</button></div>`;
+      <div><label>Warna</label><input type="color" class="form-input ti-color" value="${safeColor(t.color)}" style="padding:4px;height:36px"></div>
+      <div style="align-self:flex-end"><button class="btn-del" data-act="del-tier">✕</button></div>`;
     list.appendChild(d);
   });
 }
 
 function renderTierPreview(tiers) {
-  document.getElementById('tierPreview').innerHTML = tiers.map(t =>
-    `<span class="tier-tag" style="background:${t.color}22;color:${t.color}">${esc(t.name)} — Rp ${fmtRp(t.minRp)}+ · ${esc(t.effect)}</span>`
-  ).join('');
+  document.getElementById('tierPreview').innerHTML = tiers.map(t => {
+    const c = safeColor(t.color);
+    return `<span class="tier-tag" style="background:${c}22;color:${c}">${esc(t.name)} — Rp ${fmtRp(t.minRp)}+ · ${esc(t.effect)}</span>`;
+  }).join('');
 }
 
 function getTierTag(amount, tiers) {
-  const t = [...tiers].sort((a, b) => b.minRp - a.minRp).find(x => amount >= x.minRp);
-  return t
-    ? `<span class="tier-tag" style="background:${t.color}22;color:${t.color}">${esc(t.name)}</span>`
-    : `<span class="tier-tag" style="background:var(--surface2);color:var(--text-muted)">—</span>`;
+  const t = [...tiers]
+    .sort((a, b) => (Number(b.minRp) || 0) - (Number(a.minRp) || 0))
+    .find(x => amount >= (Number(x.minRp) || 0));
+  if (!t) return `<span class="tier-tag" style="background:var(--surface2);color:var(--text-muted)">—</span>`;
+  const c = safeColor(t.color);
+  return `<span class="tier-tag" style="background:${c}22;color:${c}">${esc(t.name)}</span>`;
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────
 const fmtRp   = n  => Number(n).toLocaleString('id-ID');
-const esc     = s  => String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+// Donor names and messages come straight from Saweria, so they are attacker
+// controlled. The single quote and backtick matter as much as the rest: without
+// them a name could close an attribute or a JS string and run script.
+const esc     = s  => String(s ?? '')
+  .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+  .replace(/"/g,'&quot;').replace(/'/g,'&#39;').replace(/`/g,'&#96;');
 const nowStr  = () => new Date().toLocaleTimeString('id-ID', { hour:'2-digit', minute:'2-digit', second:'2-digit' });
 
 function fmtTime(str) {
@@ -627,51 +677,64 @@ function showOk(id) {
 function apiKey()  { return getSession()?.key || ''; }
 function baseUrl() { return getWorkerUrl(); }
 
+// A key that the worker no longer recognises — account deleted, key rotated —
+// used to leave the dashboard logged in and failing every request. Send the
+// user back to the login screen instead.
+function checkAuth(res) {
+  if (res.status === 401 && getSession()) {
+    doLogout();
+    document.getElementById('loginErr').textContent = 'Sesi berakhir. Masuk lagi.';
+  }
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+}
+
 async function apiFetch(path) {
   const sep = path.includes('?') ? '&' : '?';
   const res = await fetch(`${baseUrl()}${path}${sep}key=${encodeURIComponent(apiKey())}`);
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  checkAuth(res);
   return res.json();
 }
 
 async function apiPost(path) {
   const sep = path.includes('?') ? '&' : '?';
   const res = await fetch(`${baseUrl()}${path}${sep}key=${encodeURIComponent(apiKey())}`, { method: 'POST' });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  checkAuth(res);
   return res.json();
 }
 
 // ── Render ─────────────────────────────────────────────────────────────
+// Donor names are untrusted, so they only ever reach the DOM through esc() for
+// display and through data-* attributes for the action buttons. They used to be
+// interpolated into an inline onclick handler, where a name containing a quote
+// escaped the JS string and could run script.
 function renderHistRows(data, tbodyId, withDelete) {
   const tbody = document.getElementById(tbodyId);
-  const cols  = withDelete ? 7 : 6;
+  const cols  = withDelete ? 6 : 5;
   if (!data?.length) {
     tbody.innerHTML = `<tr><td class="empty-td" colspan="${cols}">Belum ada data.</td></tr>`;
     return;
   }
   const tiers = getTiers();
   tbody.innerHTML = data.map(r => {
-    const name   = esc(r.donor_name || r.donorName || r.name || '—');
-    const amt    = Number(r.amount || r.total_amount || r.totalAmount || 0);
-    const status = r.status || 'claimed';
-    const msg    = esc(r.message || r.msg || '—');
-    const time   = fmtTime(r.created_at || r.timestamp || null);
-    const id     = r.id || '';
-    const stBadge = status === 'pending'
-      ? `<span class="status-pend">${esc(status)}</span>`
-      : `<span class="status-ok">${esc(status)}</span>`;
+    const rawName = r.donor_name || r.donorName || r.name || '—';
+    const amt     = Number(r.amount || r.total_amount || r.totalAmount || 0);
+    const msg     = esc(r.message || r.msg || '—');
+    const time    = fmtTime(r.created_at || r.timestamp || null);
+    const id      = esc(r.id ?? '');
+    const testTag = r.is_test
+      ? ' <span class="tier-tag" style="background:rgba(245,158,11,.15);color:#f59e0b">TEST</span>'
+      : '';
     const delTd = withDelete
       ? `<td style="display:flex;gap:6px;align-items:center">
-           <button class="btn sm" onclick="onEdit('${id}',${amt},'${esc(name)}',this)">✏️ Edit</button>
-           <button class="btn sm danger" onclick="onDelete('${id}',this)">Hapus</button>
+           <button class="btn sm" data-act="edit" data-id="${id}" data-amt="${amt}" data-name="${esc(rawName)}">✏️ Edit</button>
+           <button class="btn sm danger" data-act="del" data-id="${id}">Hapus</button>
          </td>`
       : '';
     return `<tr data-id="${id}">
       <td class="td-muted">${time}</td>
-      <td>${name}</td>
-      <td class="td-amt" id="amt-${id}">Rp ${fmtRp(amt)}</td>
-      <td>${stBadge}</td>
-      <td id="tier-${id}">${getTierTag(amt, tiers)}</td>
+      <td>${esc(rawName)}${testTag}</td>
+      <td class="td-amt" data-cell="amt">Rp ${fmtRp(amt)}</td>
+      <td data-cell="tier">${getTierTag(amt, tiers)}</td>
       <td class="td-msg">${msg}</td>
       ${delTd}
     </tr>`;
@@ -680,7 +743,7 @@ function renderHistRows(data, tbodyId, withDelete) {
 
 function renderLeaderboard(data) {
   const tbody = document.getElementById('lbTbody');
-  if (!data?.length) { tbody.innerHTML = '<tr><td class="empty-td" colspan="4">Belum ada data.</td></tr>'; return; }
+  if (!data?.length) { tbody.innerHTML = '<tr><td class="empty-td" colspan="5">Belum ada data.</td></tr>'; return; }
   const tiers = getTiers();
   tbody.innerHTML = data.map((r, i) => {
     const name = esc(r.donor_name || r.donorName || '—');
@@ -690,11 +753,25 @@ function renderLeaderboard(data) {
     return `<tr>
       <td><span class="rank-badge ${rc}">${rank}</span></td>
       <td>${name}</td>
-      <td class="td-amt">${fmtRp(amt)}</td>
+      <td class="td-amt">Rp ${fmtRp(amt)}</td>
       <td>${getTierTag(amt, tiers)}</td>
+      <td><button class="btn sm danger" data-act="del-donor" data-donor="${name}">Hapus</button></td>
     </tr>`;
   }).join('');
 }
+
+// One delegated listener for every row action, so no untrusted donor name is
+// ever interpolated into an inline handler.
+document.addEventListener('click', (ev) => {
+  const btn = ev.target.closest('[data-act]');
+  if (!btn) return;
+  const d = btn.dataset;
+  if (d.act === 'edit')       onEdit(d.id, Number(d.amt), d.name, btn);
+  if (d.act === 'del')        onDelete(d.id, btn);
+  if (d.act === 'del-donor')  onDeleteDonor(btn);
+  if (d.act === 'del-acct')   deleteAccount(d.email, btn);
+  if (d.act === 'del-tier')   btn.closest('.tier-row')?.remove();
+});
 
 function updateInfoCards() {
   const url = baseUrl();
@@ -735,7 +812,7 @@ async function submitAdd() {
 
   try {
     const res = await fetch(
-      `${baseUrl()}/webhook/${apiKey()}`,
+      `${baseUrl()}/webhook/${encodeURIComponent(apiKey())}`,
       { method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ donatur: name, nominal: amt, pesan: msg }) }
     );
@@ -743,7 +820,7 @@ async function submitAdd() {
       closeAddModal();
       refreshAll();
     } else {
-      alert('Gagal menambah donor.');
+      alert('Gagal menambah donor: ' + (await res.text().catch(() => `HTTP ${res.status}`)));
     }
   } catch(e) {
     alert('Error: ' + e.message);
@@ -774,39 +851,29 @@ async function submitEdit() {
 
   try {
     const res = await fetch(
-      `${baseUrl()}/history/${_editId}/edit?key=${encodeURIComponent(apiKey())}`,
+      `${baseUrl()}/history/${encodeURIComponent(_editId)}/edit?key=${encodeURIComponent(apiKey())}`,
       { method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ amount: newAmt, donor_name: newName }) }
     );
-    if (res.ok) {
-      const amtEl  = document.getElementById('amt-'  + _editId);
-      const tierEl = document.getElementById('tier-' + _editId);
-      const row    = document.querySelector(`tr[data-id="${_editId}"]`);
-      if (amtEl)  amtEl.textContent = 'Rp ' + fmtRp(newAmt);
-      if (tierEl) tierEl.innerHTML  = getTierTag(newAmt, getTiers());
-      if (row) {
-        const nameTd = row.querySelector('td:nth-child(2)');
-        if (nameTd) nameTd.textContent = newName;
-      }
-      closeEditModal();
-    } else {
-      alert('Gagal menyimpan.');
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      alert('Gagal menyimpan: ' + (data.error || `HTTP ${res.status}`));
+      return;
     }
+    closeEditModal();
+    // Patching the row by hand left the dashboard copy, the leaderboard and the
+    // all-time total showing pre-edit figures until the next auto-refresh.
+    refreshAll();
   } catch(e) {
     alert('Error: ' + e.message);
   }
 }
 
 // ── Account Management ─────────────────────────────────────────────────
-function adminParam() {
-  return `&admin=${encodeURIComponent(getSession()?.email || '')}`;
-}
-
 async function loadAccounts() {
+  const list = document.getElementById('accountList');
   try {
-    const data = await apiFetch(`/accounts?admin=${encodeURIComponent(getSession()?.email || '')}`);
-    const list = document.getElementById('accountList');
-    const accounts = data.data || [];
+    const accounts = (await apiFetch('/accounts')).data || [];
     if (!accounts.length) {
       list.innerHTML = '<div style="font-size:0.82rem;color:var(--text-muted)">Belum ada akun tambahan.</div>';
       return;
@@ -817,9 +884,12 @@ async function loadAccounts() {
           <div style="font-size:0.85rem">${esc(a.email)}</div>
           <div style="font-size:0.72rem;color:var(--text-muted);font-family:monospace;word-break:break-all">${esc(a.apiKey || '—')}</div>
         </div>
-        <button class="btn sm danger" onclick="deleteAccount('${esc(a.email)}',this)">Hapus</button>
+        <button class="btn sm danger" data-act="del-acct" data-email="${esc(a.email)}">Hapus</button>
       </div>`).join('');
-  } catch {}
+  } catch (e) {
+    // Silently swallowing this left the panel stuck on whatever it showed last.
+    list.innerHTML = `<div style="font-size:0.82rem;color:var(--danger)">Gagal memuat daftar akun (${esc(e.message)}).</div>`;
+  }
 }
 
 async function addAccount() {
@@ -832,12 +902,12 @@ async function addAccount() {
   if (!email || !pass) { err.textContent = 'Isi email dan password.'; err.classList.add('show'); return; }
 
   try {
-    const res  = await fetch(`${baseUrl()}/accounts?key=${encodeURIComponent(apiKey())}${adminParam()}`, {
+    const res  = await fetch(`${baseUrl()}/accounts?key=${encodeURIComponent(apiKey())}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ email, password: pass }),
     });
-    const data = await res.json();
+    const data = await res.json().catch(() => ({ ok: false, error: `HTTP ${res.status}` }));
     if (data.ok) {
       document.getElementById('newAccEmail').value = '';
       document.getElementById('newAccPass').value  = '';
@@ -855,26 +925,47 @@ async function addAccount() {
 }
 
 async function deleteAccount(email, btn) {
-  if (!confirm(`Hapus akun ${email}?`)) return;
+  if (!confirm(`Hapus akun ${email}? Semua donasi, leaderboard dan konfigurasi akun ini ikut terhapus.`)) return;
   btn.disabled = true; btn.textContent = '…';
   try {
-    await fetch(`${baseUrl()}/accounts/delete?key=${encodeURIComponent(apiKey())}${adminParam()}`, {
+    const res = await fetch(`${baseUrl()}/accounts/delete?key=${encodeURIComponent(apiKey())}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ email }),
     });
+    // A failed delete used to leave the row looking deleted on the next reload.
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
     loadAccounts();
   } catch {
-    btn.disabled = false; btn.textContent = 'Hapus';
+    btn.disabled = false; btn.textContent = 'Gagal, coba lagi';
   }
 }
 
 async function onDelete(id, btn) {
   if (!id) { alert('ID tidak ditemukan.'); return; }
+  if (!confirm('Hapus donasi ini?')) return;
   btn.disabled = true; btn.textContent = '…';
   try {
-    await apiPost(`/history/${id}/delete`);
-    btn.closest('tr').remove();
+    await apiPost(`/history/${encodeURIComponent(id)}/delete`);
+    // Removing just this row left the dashboard copy and the stats stale.
+    refreshAll();
+  } catch {
+    btn.textContent = 'Gagal';
+    setTimeout(() => { btn.disabled = false; btn.textContent = 'Hapus'; }, 2000);
+  }
+}
+
+// Leaderboard dihitung worker dari daftar donasi, jadi hapus donor =
+// hapus semua donasinya lewat endpoint delete history yang sudah ada.
+async function onDeleteDonor(btn) {
+  const donor = btn.dataset.donor;
+  if (!confirm(`Hapus semua donasi dari ${donor}?`)) return;
+  btn.disabled = true; btn.textContent = '…';
+  try {
+    const hist = (await apiFetch('/history')).data || [];
+    const ids  = hist.filter(r => (r.donor_name || r.donorName) === donor).map(r => r.id);
+    for (const id of ids) await apiPost(`/history/${encodeURIComponent(id)}/delete`);
+    refreshAll();
   } catch {
     btn.textContent = 'Gagal';
     setTimeout(() => { btn.disabled = false; btn.textContent = 'Hapus'; }, 2000);
@@ -894,7 +985,24 @@ async function testNotif() {
 }
 
 // ── Refresh ────────────────────────────────────────────────────────────
+let _refreshTimer = null;
+
+function startAutoRefresh() {
+  // initApp runs again on every login, which used to stack a second, third …
+  // interval on top of the first — each one firing its own round of requests.
+  stopAutoRefresh();
+  _refreshTimer = setInterval(refreshAll, 60_000);
+}
+
+function stopAutoRefresh() {
+  if (_refreshTimer !== null) { clearInterval(_refreshTimer); _refreshTimer = null; }
+}
+
 async function refreshAll() {
+  // After logout the interval kept firing with an empty key, so the worker saw
+  // a 401 every minute from a page nobody was logged into.
+  if (!apiKey()) { stopAutoRefresh(); return; }
+
   const now = nowStr();
   document.getElementById('refreshInfo').textContent = 'Memuat…';
   updateInfoCards();
@@ -927,11 +1035,14 @@ async function refreshAll() {
     const hist = (await apiFetch('/history')).data || [];
     renderHistRows(hist, 'histTbody', true);
     renderHistRows(hist.slice(0, 5), 'dashTbody', false);
+    // Re-rendering wiped the search box's effect, so the auto-refresh silently
+    // un-filtered the table every minute while the query stayed in the box.
+    filterHistory();
     document.getElementById('histUpdate').textContent  = now;
     document.getElementById('dashUpdate').textContent  = now;
-  } catch {
+  } catch (e) {
     document.getElementById('histTbody').innerHTML =
-      '<tr><td class="empty-td" colspan="7">Endpoint /history tidak tersedia.</td></tr>';
+      `<tr><td class="empty-td" colspan="6">Gagal memuat history (${esc(e.message)}).</td></tr>`;
   }
 }
 
@@ -964,7 +1075,7 @@ function initApp() {
   renderTierPreview(getTiers());
   loadTiersFromWorker();
   refreshAll();
-  setInterval(refreshAll, 60_000);
+  startAutoRefresh();
 }
 
 // ── Boot ───────────────────────────────────────────────────────────────

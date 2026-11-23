@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { handleAddAccount, handleListAccounts, handleDeleteAccount, getAccounts } from '../worker.js';
 import { mockEnv, makeReq } from './helpers.js';
 
-test('handleAddAccount: stores account with generated apiKey', async () => {
+test('handleAddAccount: stores account with generated apiKey, password hashed not plaintext', async () => {
   const env = mockEnv({}, 'ADMINKEY');
   const res = await handleAddAccount(makeReq({ email: 'a@x', password: 'pass' }), env);
   const body = await res.json();
@@ -13,8 +13,11 @@ test('handleAddAccount: stores account with generated apiKey', async () => {
   const accounts = JSON.parse(env._store.get('accounts'));
   assert.equal(accounts.length, 1);
   assert.equal(accounts[0].email, 'a@x');
-  assert.equal(accounts[0].password, 'pass');
   assert.equal(accounts[0].apiKey, body.apiKey);
+  assert.equal(accounts[0].password, undefined, 'plaintext password is never stored');
+  assert.equal(typeof accounts[0].hash, 'string');
+  assert.equal(typeof accounts[0].salt, 'string');
+  assert.ok(!env._store.get('accounts').includes('pass'), 'KV value contains no plaintext password');
 });
 
 test('handleAddAccount: rejects duplicate email', async () => {
@@ -22,6 +25,31 @@ test('handleAddAccount: rejects duplicate email', async () => {
   const res = await handleAddAccount(makeReq({ email: 'a@x', password: 'pass' }), env);
   const body = await res.json();
   assert.equal(body.ok, false);
+});
+
+test('handleAddAccount: duplicate check ignores email case and surrounding space', async () => {
+  const env = mockEnv({ accounts: JSON.stringify([{ email: 'a@x', password: 'p', apiKey: 'k1' }]) }, 'ADMINKEY');
+  const res = await handleAddAccount(makeReq({ email: '  A@X  ', password: 'pass' }), env);
+  assert.equal((await res.json()).ok, false);
+  assert.equal(JSON.parse(env._store.get('accounts')).length, 1);
+});
+
+test('handleAddAccount: validation errors come back as JSON, not plain text', async () => {
+  const env = mockEnv({}, 'ADMINKEY');
+  for (const payload of [{ email: '', password: '' }, { email: 'a@x', password: 'ab' }]) {
+    const res = await handleAddAccount(makeReq(payload), env);
+    assert.equal(res.status, 400);
+    assert.match(res.headers.get('Content-Type'), /application\/json/);
+    const body = await res.json();      // used to throw: body was plain text
+    assert.equal(body.ok, false);
+    assert.equal(typeof body.error, 'string');
+  }
+});
+
+test('handleAddAccount: refuses to shadow the admin email', async () => {
+  const env = mockEnv({}, 'ADMINKEY');
+  const res = await handleAddAccount(makeReq({ email: 'ADMIN@TEST', password: 'pass' }), env);
+  assert.equal((await res.json()).ok, false);
 });
 
 test('handleListAccounts: returns email + apiKey, never password', async () => {
@@ -38,6 +66,7 @@ test('handleDeleteAccount: removes account and its data', async () => {
     'donations:k1': '[]',
     'leaderboard:k1': '[]',
     'tier_config:k1': '{}',
+    'stats:k1': JSON.stringify({ total: 99000 }),
   }, 'ADMINKEY');
   const res = await handleDeleteAccount(makeReq({ email: 'a@x' }), env);
   assert.equal((await res.json()).ok, true);
@@ -45,6 +74,7 @@ test('handleDeleteAccount: removes account and its data', async () => {
   assert.equal(env._store.has('donations:k1'), false);
   assert.equal(env._store.has('leaderboard:k1'), false);
   assert.equal(env._store.has('tier_config:k1'), false);
+  assert.equal(env._store.has('stats:k1'), false, 'running total removed too');
 });
 
 test('handleDeleteAccount: unknown email returns 404 and leaves accounts intact', async () => {
