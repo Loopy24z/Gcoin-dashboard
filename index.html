@@ -384,11 +384,30 @@
 
 <script>
 // ── Constants ──────────────────────────────────────────────────────────
-// Both the Vercel deployment and the Worker itself serve this page and proxy
-// the same API paths, so the page's own origin is always the right default.
-// Hardcoding one host meant a saved URL outlived the backend it pointed at.
-const FALLBACK_URL = 'https://sw-dashboard-mocha.vercel.app';
-const DEFAULT_URL  = /^https?:$/.test(location.protocol) ? location.origin : FALLBACK_URL;
+// Where the API lives depends on who is serving this page:
+//   - the Worker itself, a dev server, or a host with proxy rewrites
+//     (Vercel) answers the API paths on the page's own origin;
+//   - a static host (GitHub Pages) cannot proxy anything, so the Worker has
+//     to be called cross-origin. It sends Access-Control-Allow-Origin: *.
+// Probed once instead of hardcoded: a hardcoded host is exactly what left the
+// dashboard pointing at a backend that had been paused.
+const WORKER_URL  = 'https://gcoin-api.verifmlbb629.workers.dev';
+const PAGE_ORIGIN = /^https?:$/.test(location.protocol) ? location.origin : WORKER_URL;
+
+let _apiBase = null;
+
+// GET /queue answers 401 wherever the API is reachable (no key given) and 404
+// where it is not, which is the cheapest way to tell the two hosts apart.
+async function resolveApiBase() {
+  if (localStorage.getItem('gcoin_url')) return;   // an explicit setting wins
+  if (PAGE_ORIGIN === WORKER_URL) { _apiBase = WORKER_URL; return; }
+  try {
+    const res = await fetch(`${PAGE_ORIGIN}/queue?key=`);
+    _apiBase = res.status === 404 ? WORKER_URL : PAGE_ORIGIN;
+  } catch {
+    _apiBase = WORKER_URL;
+  }
+}
 
 // ── Auth ───────────────────────────────────────────────────────────────
 function getSession() {
@@ -409,6 +428,7 @@ async function doLogin() {
   btn.textContent = 'Masuk…';
   err.textContent = '';
 
+  await resolveApiBase();
   const url = getWorkerUrl();
   const requestLogin = (baseUrl) => fetch(`${baseUrl}/api/login`, {
     method: 'POST',
@@ -421,12 +441,11 @@ async function doLogin() {
     try {
       res = await requestLogin(url);
     } catch (primaryError) {
-      // A saved URL can outlive the backend it pointed at. Retry through the
-      // origin this page was served from, which always proxies the API, and
-      // keep that as the new setting.
-      if (url === DEFAULT_URL) throw primaryError;
-      res = await requestLogin(DEFAULT_URL);
-      localStorage.setItem('gcoin_url', DEFAULT_URL);
+      // A saved URL can outlive the backend it pointed at. Retry straight at
+      // the Worker before reporting a network failure, and keep what worked.
+      if (url === WORKER_URL) throw primaryError;
+      res = await requestLogin(WORKER_URL);
+      localStorage.setItem('gcoin_url', WORKER_URL);
     }
     const data = await res.json().catch(() => ({ ok: false, error: `Jawaban tidak valid (HTTP ${res.status})` }));
     if (data.ok) {
@@ -456,7 +475,7 @@ function doLogout() {
 
 // ── Config ─────────────────────────────────────────────────────────────
 function getWorkerUrl() {
-  return (localStorage.getItem('gcoin_url') || DEFAULT_URL).replace(/\/$/, '');
+  return (localStorage.getItem('gcoin_url') || _apiBase || PAGE_ORIGIN).replace(/\/$/, '');
 }
 
 function saveCfg() {
@@ -1079,12 +1098,17 @@ function initApp() {
 }
 
 // ── Boot ───────────────────────────────────────────────────────────────
-const session = getSession();
-if (session?.key) {
-  document.getElementById('authWrap').style.display = 'none';
-  document.getElementById('app').classList.add('show');
-  initApp();
-}
+// The API base has to be settled before the first request goes out, so a
+// restored session waits for the probe rather than firing at the wrong host.
+(async () => {
+  await resolveApiBase();
+  const session = getSession();
+  if (session?.key) {
+    document.getElementById('authWrap').style.display = 'none';
+    document.getElementById('app').classList.add('show');
+    initApp();
+  }
+})();
 </script>
 </body>
 </html>
