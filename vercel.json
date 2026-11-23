@@ -2,12 +2,44 @@
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "rewrites": [
     {
-      "source": "/",
-      "destination": "https://gcoin-api.verifmlbb629.workers.dev/"
+      "source": "/api/:path*",
+      "destination": "https://gcoin-api.verifmlbb629.workers.dev/api/:path*"
     },
     {
-      "source": "/:path*",
-      "destination": "https://gcoin-api.verifmlbb629.workers.dev/:path*"
+      "source": "/webhook/:path*",
+      "destination": "https://gcoin-api.verifmlbb629.workers.dev/webhook/:path*"
+    },
+    {
+      "source": "/queue",
+      "destination": "https://gcoin-api.verifmlbb629.workers.dev/queue"
+    },
+    {
+      "source": "/leaderboard",
+      "destination": "https://gcoin-api.verifmlbb629.workers.dev/leaderboard"
+    },
+    {
+      "source": "/history",
+      "destination": "https://gcoin-api.verifmlbb629.workers.dev/history"
+    },
+    {
+      "source": "/history/:path*",
+      "destination": "https://gcoin-api.verifmlbb629.workers.dev/history/:path*"
+    },
+    {
+      "source": "/test-notification",
+      "destination": "https://gcoin-api.verifmlbb629.workers.dev/test-notification"
+    },
+    {
+      "source": "/accounts",
+      "destination": "https://gcoin-api.verifmlbb629.workers.dev/accounts"
+    },
+    {
+      "source": "/accounts/:path*",
+      "destination": "https://gcoin-api.verifmlbb629.workers.dev/accounts/:path*"
+    },
+    {
+      "source": "/config",
+      "destination": "https://gcoin-api.verifmlbb629.workers.dev/config"
     }
   ]
 }

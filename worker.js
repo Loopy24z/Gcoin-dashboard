@@ -23,6 +23,11 @@ const json = (data, status = 200) =>
 const fail = (msg, status = 400) =>
   new Response(msg, { status, headers: CORS });
 
+// The dashboard calls res.json() on these replies, so validation errors have to
+// be JSON too — a plain-text body made the UI show a JSON parse error instead of
+// the actual reason the request was rejected.
+const failJson = (error, status = 400) => json({ ok: false, error }, status);
+
 // ── Tenant routing helpers ───────────────────────────────────────────────
 export function nsKey(prefix, key, env) {
   return key === env.API_KEY ? prefix : `${prefix}:${key}`;
@@ -164,21 +169,24 @@ export async function handleWebhook(request, env, key) {
   let body;
   try { body = await request.json(); } catch { return fail('Invalid JSON'); }
 
+  // Log only the shape, never the payload: donor names and messages are personal
+  // data and these logs are retained by Cloudflare.
   console.log('[webhook] body keys:', Object.keys(body).join(','));
-  console.log('[webhook] body:', JSON.stringify(body));
 
-  const name   = body.donatur || body.donator_name || body.donor_name || body.name || 'Anonymous';
+  const name   = String(body.donatur || body.donator_name || body.donor_name || body.name || 'Anonymous');
   const amount = Number(body.amount_raw ?? body.nominal ?? body.amount ?? 0);
   const msg    = body.pesan || body.message || '';
   const time   = body.created_at || body.created_on || body.paid_at || new Date().toISOString();
 
-  if (!amount) return fail('No amount: ' + JSON.stringify(body));
+  if (!Number.isFinite(amount) || amount <= 0) {
+    return fail(`No usable amount in webhook (keys: ${Object.keys(body).join(',')})`);
+  }
 
   const cfg       = await getConfig(env, key);
   const level     = levelForAmount(amount, cfg.tiers);
   const donations = await getDonations(env, key);
   donations.unshift({
-    id:         Date.now(),
+    id:         nextDonationId(donations),
     donor_name: name,
     amount,
     level,
@@ -189,9 +197,19 @@ export async function handleWebhook(request, env, key) {
 
   if (donations.length > 100) donations.splice(100);
   await env.DB.put(nsKey('donations', key, env), JSON.stringify(donations));
-  await updateLeaderboard(env, donations, key);
+  await bumpLeaderboard(env, key, [{ name, delta: amount }], donations);
   await bumpTotal(env, key, amount, donations);
   return json({ ok: true });
+}
+
+// Ids double as the queue's delivery-window timestamp, so they stay millisecond
+// based — but two donations landing in the same millisecond used to collide,
+// which broke per-id delete/edit and duplicated DOM ids in the dashboard.
+export function nextDonationId(donations) {
+  let id = Date.now();
+  const taken = new Set(donations.map(d => Number(d.id)));
+  while (taken.has(id)) id++;
+  return id;
 }
 
 // ── Queue ──────────────────────────────────────────────────────────────
@@ -206,9 +224,12 @@ export async function handleQueue(env, key) {
   const cutoff    = Date.now() - QUEUE_WINDOW_MS;
   const recent    = donations.filter(d => Number(d.id) >= cutoff);
 
+  // `level` is included so the tier table edited in the dashboard is what the
+  // game reacts to. Roblox can still compute it locally from the pasted Lua.
   return json({
-    data: recent.map(({ id, donor_name, amount, message, created_at }) => ({
+    data: recent.map(({ id, donor_name, amount, message, created_at, level }) => ({
       id, donor_name, donorName: donor_name, amount, message, created_at,
+      level: Number(level) || 0,
     })),
   });
 }
@@ -216,11 +237,16 @@ export async function handleQueue(env, key) {
 // ── Leaderboard ────────────────────────────────────────────────────────
 export async function handleLeaderboard(env, key) {
   const raw = await env.DB.get(nsKey('leaderboard', key, env));
-  const data = raw ? JSON.parse(raw) : [];
+  const board = raw ? JSON.parse(raw) : [];
+  // The stored board keeps every donor so running totals survive; only the
+  // response is trimmed to the top 20 the dashboard shows.
+  const data = [...board]
+    .sort((a, b) => (Number(b.total_amount) || 0) - (Number(a.total_amount) || 0))
+    .slice(0, 20);
   const statsRaw = await env.DB.get(nsKey('stats', key, env));
   const total = statsRaw
     ? (Number(JSON.parse(statsRaw).total) || 0)
-    : data.reduce((s, r) => s + (Number(r.total_amount) || 0), 0);
+    : board.reduce((s, r) => s + (Number(r.total_amount) || 0), 0);
   return json({ data, total });
 }
 
@@ -234,11 +260,14 @@ export async function handleHistory(env, key) {
 export async function handleDelete(id, env, key) {
   const donations = await getDonations(env, key);
   const idx = donations.findIndex(d => String(d.id) === String(id));
-  if (idx === -1) return fail('Not found', 404);
-  const removedAmount = Number(donations[idx].amount) || 0;
+  if (idx === -1) return failJson('Donasi tidak ditemukan', 404);
+  // Test rows were never added to the total or the leaderboard, so removing one
+  // must not subtract from them either.
+  const removedAmount = donations[idx].is_test ? 0 : (Number(donations[idx].amount) || 0);
+  const removedName   = donations[idx].donor_name;
   donations.splice(idx, 1);
   await env.DB.put(nsKey('donations', key, env), JSON.stringify(donations));
-  await updateLeaderboard(env, donations, key);
+  await bumpLeaderboard(env, key, [{ name: removedName, delta: -removedAmount }], donations);
   await bumpTotal(env, key, -removedAmount, donations);
   return json({ ok: true });
 }
@@ -246,64 +275,150 @@ export async function handleDelete(id, env, key) {
 // ── Edit Entry ─────────────────────────────────────────────────────────
 export async function handleEditAmount(id, request, env, key) {
   let body;
-  try { body = await request.json(); } catch { return fail('Invalid JSON'); }
+  try { body = await request.json(); } catch { return failJson('Invalid JSON'); }
 
   const donations = await getDonations(env, key);
   const idx = donations.findIndex(d => String(d.id) === String(id));
-  if (idx === -1) return fail('Not found', 404);
+  if (idx === -1) return failJson('Donasi tidak ditemukan', 404);
+
+  const isTest    = donations[idx].is_test === true;
+  const oldAmount = Number(donations[idx].amount) || 0;
+  const oldName   = donations[idx].donor_name;
 
   let amountDelta = 0;
+  let newAmount   = oldAmount;
   if (body.amount !== undefined) {
-    const newAmount = Number(body.amount);
-    if (!newAmount || newAmount <= 0) return fail('Amount tidak valid');
-    amountDelta = newAmount - (Number(donations[idx].amount) || 0);
+    newAmount = Number(body.amount);
+    if (!Number.isFinite(newAmount) || newAmount <= 0) return failJson('Amount tidak valid');
+    amountDelta = newAmount - oldAmount;
     donations[idx].amount = newAmount;
+    // The tier config may have changed since the donation arrived, so re-derive
+    // the level instead of leaving a stale one attached to a new amount.
+    const cfg = await getConfig(env, key);
+    donations[idx].level = levelForAmount(newAmount, cfg.tiers);
   }
-  if (body.donor_name !== undefined && body.donor_name.trim()) {
-    donations[idx].donor_name = body.donor_name.trim();
+
+  let newName = oldName;
+  if (body.donor_name !== undefined && String(body.donor_name).trim()) {
+    newName = String(body.donor_name).trim();
+    donations[idx].donor_name = newName;
+  }
+
+  // A rename moves the whole donation between donors on the leaderboard, so
+  // debit the old name in full and credit the new one in full. Test rows are
+  // outside the totals entirely, so they contribute nothing either way.
+  let adjustments = [];
+  if (!isTest) {
+    adjustments = newName === oldName
+      ? [{ name: newName, delta: amountDelta }]
+      : [{ name: oldName, delta: -oldAmount }, { name: newName, delta: newAmount }];
   }
 
   await env.DB.put(nsKey('donations', key, env), JSON.stringify(donations));
-  await updateLeaderboard(env, donations, key);
-  await bumpTotal(env, key, amountDelta, donations);
+  await bumpLeaderboard(env, key, adjustments, donations);
+  await bumpTotal(env, key, isTest ? 0 : amountDelta, donations);
   return json({ ok: true });
 }
 
 // ── Test Notif ─────────────────────────────────────────────────────────
-async function handleTestNotif(env, key) {
+// A test donation has to reach the Roblox queue to be worth anything, so it is
+// stored like a real one — but it is NOT counted in the all-time total or the
+// leaderboard. Every test press used to add a permanent Rp 25.000 to the real
+// figures, and deleting the row afterwards did not take it back out.
+const TEST_AMOUNT = 25000;
+
+export async function handleTestNotif(env, key) {
+  const cfg       = await getConfig(env, key);
   const donations = await getDonations(env, key);
   donations.unshift({
-    id:         Date.now(),
+    id:         nextDonationId(donations),
     donor_name: 'TestDonor',
-    amount:     25000,
+    amount:     TEST_AMOUNT,
+    level:      levelForAmount(TEST_AMOUNT, cfg.tiers),
     message:    'Test notification dari dashboard',
     status:     'pending',
+    is_test:    true,
     created_at: new Date().toISOString(),
   });
   if (donations.length > 100) donations.splice(100);
   await env.DB.put(nsKey('donations', key, env), JSON.stringify(donations));
-  await updateLeaderboard(env, donations, key);
-  await bumpTotal(env, key, 25000, donations);
   return json({ ok: true });
+}
+
+// ── Passwords ──────────────────────────────────────────────────────────
+// Account passwords used to sit in KV as plaintext, so anything that could read
+// the namespace read every user's password — and people reuse passwords. They
+// are now stored as a PBKDF2-SHA256 hash with a per-account random salt.
+// Records written before this change still carry a `password` field; they are
+// accepted once and rewritten as a hash on the next successful login.
+const PBKDF2_ITERATIONS = 100_000;
+
+const toHex = (bytes) =>
+  [...bytes].map(b => b.toString(16).padStart(2, '0')).join('');
+
+const fromHex = (hex) =>
+  new Uint8Array((hex.match(/.{1,2}/g) || []).map(h => parseInt(h, 16)));
+
+export async function hashPassword(password, saltHex) {
+  const salt = saltHex ? fromHex(saltHex) : crypto.getRandomValues(new Uint8Array(16));
+  const material = await crypto.subtle.importKey(
+    'raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveBits'],
+  );
+  const bits = await crypto.subtle.deriveBits(
+    { name: 'PBKDF2', hash: 'SHA-256', salt, iterations: PBKDF2_ITERATIONS },
+    material, 256,
+  );
+  return { salt: toHex(salt), hash: toHex(new Uint8Array(bits)) };
+}
+
+// Compare without leaking how many leading characters matched.
+function timingSafeEqual(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string' || a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
+}
+
+export async function verifyPassword(account, password) {
+  if (typeof password !== 'string' || !password) return false;
+  if (account.hash && account.salt) {
+    const { hash } = await hashPassword(password, account.salt);
+    return timingSafeEqual(hash, account.hash);
+  }
+  // Legacy plaintext record.
+  return typeof account.password === 'string' && timingSafeEqual(account.password, password);
 }
 
 // ── Login ──────────────────────────────────────────────────────────────
 export async function handleLogin(request, env) {
   let body;
-  try { body = await request.json(); } catch { return fail('Invalid JSON'); }
+  try { body = await request.json(); } catch { return failJson('Invalid JSON'); }
 
-  const { email, password } = body;
+  const email    = typeof body.email === 'string' ? body.email.trim().toLowerCase() : '';
+  const password = body.password;
 
   // Cek akun utama (env vars) — admin
-  if (email === env.ADMIN_EMAIL && password === env.ADMIN_PASS) {
+  const adminEmail = String(env.ADMIN_EMAIL || '').trim().toLowerCase();
+  if (email && adminEmail && email === adminEmail &&
+      timingSafeEqual(String(password ?? ''), String(env.ADMIN_PASS ?? ''))) {
     return json({ ok: true, key: env.API_KEY, isAdmin: true });
   }
 
   // Cek akun tambahan (KV) — bukan admin, pakai apiKey sendiri
   const accounts = await getAccounts(env);
-  const found = accounts.find(a => a.email === email && a.password === password);
-  if (found) {
-    return json({ ok: true, key: found.apiKey, isAdmin: false });
+  for (const account of accounts) {
+    if (String(account.email || '').trim().toLowerCase() !== email) continue;
+    if (!(await verifyPassword(account, password))) break;
+
+    // Upgrade a legacy plaintext record now that the password is known good.
+    if (account.password !== undefined) {
+      const { salt, hash } = await hashPassword(password);
+      delete account.password;
+      account.salt = salt;
+      account.hash = hash;
+      await env.DB.put('accounts', JSON.stringify(accounts));
+    }
+    return json({ ok: true, key: account.apiKey, isAdmin: false });
   }
 
   return json({ ok: false, error: 'Email atau password salah' }, 401);
@@ -329,40 +444,49 @@ export async function handleListAccounts(env) {
 
 export async function handleAddAccount(request, env) {
   let body;
-  try { body = await request.json(); } catch { return fail('Invalid JSON'); }
+  try { body = await request.json(); } catch { return failJson('Invalid JSON'); }
 
-  const { email, password } = body;
-  if (!email || !password) return fail('Email dan password wajib diisi');
-  if (password.length < 4) return fail('Password minimal 4 karakter');
+  const email    = typeof body.email === 'string' ? body.email.trim().toLowerCase() : '';
+  const password = typeof body.password === 'string' ? body.password : '';
+  if (!email || !password)   return failJson('Email dan password wajib diisi');
+  if (!email.includes('@'))  return failJson('Email tidak valid');
+  if (password.length < 4)   return failJson('Password minimal 4 karakter');
 
   const accounts = await getAccounts(env);
-  if (accounts.find(a => a.email === email)) {
-    return json({ ok: false, error: 'Email sudah terdaftar' }, 400);
+  if (accounts.some(a => String(a.email || '').trim().toLowerCase() === email)) {
+    return failJson('Email sudah terdaftar');
+  }
+  if (email === String(env.ADMIN_EMAIL || '').trim().toLowerCase()) {
+    return failJson('Email itu dipakai akun admin');
   }
 
   const apiKey = generateApiKey(accounts, env);
-  accounts.push({ email, password, apiKey });
+  const { salt, hash } = await hashPassword(password);
+  accounts.push({ email, salt, hash, apiKey });
   await env.DB.put('accounts', JSON.stringify(accounts));
   return json({ ok: true, apiKey });
 }
 
 export async function handleDeleteAccount(request, env) {
   let body;
-  try { body = await request.json(); } catch { return fail('Invalid JSON'); }
+  try { body = await request.json(); } catch { return failJson('Invalid JSON'); }
 
-  const { email } = body;
-  if (!email) return fail('Email wajib diisi');
+  const email = typeof body.email === 'string' ? body.email.trim().toLowerCase() : '';
+  if (!email) return failJson('Email wajib diisi');
 
-  const accounts = await getAccounts(env);
-  const acct = accounts.find(a => a.email === email);
-  if (!acct) return json({ ok: false, error: 'Akun tidak ditemukan' }, 404);
-  const filtered = accounts.filter(a => a.email !== email);
-  await env.DB.put('accounts', JSON.stringify(filtered));
+  const sameEmail = a => String(a.email || '').trim().toLowerCase() === email;
+  const accounts  = await getAccounts(env);
+  const acct      = accounts.find(sameEmail);
+  if (!acct) return failJson('Akun tidak ditemukan', 404);
+  await env.DB.put('accounts', JSON.stringify(accounts.filter(a => !sameEmail(a))));
 
-  if (acct?.apiKey) {
+  if (acct.apiKey) {
     await env.DB.delete(nsKey('donations', acct.apiKey, env));
     await env.DB.delete(nsKey('leaderboard', acct.apiKey, env));
     await env.DB.delete(nsKey('tier_config', acct.apiKey, env));
+    // The running total was left behind on delete, so re-creating an account
+    // that happened to get the same key inherited a stale all-time figure.
+    await env.DB.delete(nsKey('stats', acct.apiKey, env));
   }
   return json({ ok: true });
 }
@@ -379,13 +503,53 @@ export async function getDonations(env, key) {
 // Keep a separate counter: +amount on donation, -amount on delete, adjusted on
 // edit. On cold start seed from whatever donations remain — history before the
 // last 100 was never stored, so this recalibrates and stays accurate from here.
+const realDonations = (donations) => donations.filter(d => d.is_test !== true);
+
 async function bumpTotal(env, key, delta, donationsAfter) {
   const raw = await env.DB.get(nsKey('stats', key, env));
   let total = raw
     ? (Number(JSON.parse(raw).total) || 0) + delta
-    : donationsAfter.reduce((s, d) => s + (Number(d.amount) || 0), 0);
+    : realDonations(donationsAfter).reduce((s, d) => s + (Number(d.amount) || 0), 0);
   if (total < 0) total = 0;
   await env.DB.put(nsKey('stats', key, env), JSON.stringify({ total }));
+}
+
+// ── Running per-donor leaderboard ────────────────────────────────────────
+// Same problem as the all-time total: the donations list is capped at 100, so
+// recomputing the board from it made each donor's lifetime total shrink as
+// their older donations aged out. The board is now its own running tally —
+// credited on donation, debited on delete, moved on rename — and keeps EVERY
+// donor, not just the visible top 20, so a donor who drops off the board and
+// later returns resumes from their real total instead of restarting.
+const MAX_LEADERBOARD_ENTRIES = 2000;
+
+export async function bumpLeaderboard(env, key, adjustments, donationsAfter) {
+  const dbKey = nsKey('leaderboard', key, env);
+  const raw   = await env.DB.get(dbKey);
+  const totals = {};
+
+  if (raw) {
+    for (const r of JSON.parse(raw)) {
+      totals[r.donor_name] = (totals[r.donor_name] || 0) + (Number(r.total_amount) || 0);
+    }
+    for (const { name, delta } of adjustments) {
+      totals[name] = (totals[name] || 0) + delta;
+    }
+  } else {
+    // Cold start: seed from the donations that remain. History beyond the cap
+    // was never stored, so this recalibrates once and stays accurate from here.
+    for (const d of realDonations(donationsAfter)) {
+      totals[d.donor_name] = (totals[d.donor_name] || 0) + (Number(d.amount) || 0);
+    }
+  }
+
+  const board = Object.entries(totals)
+    .filter(([, amount]) => amount > 0)
+    .map(([donor_name, total_amount]) => ({ donor_name, total_amount }))
+    .sort((a, b) => b.total_amount - a.total_amount)
+    .slice(0, MAX_LEADERBOARD_ENTRIES);
+
+  await env.DB.put(dbKey, JSON.stringify(board));
 }
 
 // ── Config ─────────────────────────────────────────────────────────────
@@ -400,39 +564,59 @@ const DEFAULT_CONFIG = {
 };
 
 export async function handleGetConfig(env, key) {
-  const raw = await env.DB.get(nsKey('tier_config', key, env));
-  return json(raw ? JSON.parse(raw) : DEFAULT_CONFIG);
+  return json(await getConfig(env, key));
 }
 
-async function handleSetConfig(request, env, key) {
+// A config POST with no usable tier list used to be stored as-is, and every
+// later webhook then threw on it — one bad save silently broke donations for
+// that tenant. Validate here and reject instead.
+export async function handleSetConfig(request, env, key) {
   let body;
-  try { body = await request.json(); } catch { return fail('Invalid JSON'); }
-  await env.DB.put(nsKey('tier_config', key, env), JSON.stringify(body));
+  try { body = await request.json(); } catch { return failJson('Invalid JSON'); }
+
+  if (!Array.isArray(body?.tiers) || body.tiers.length === 0) {
+    return failJson('Config harus punya minimal satu tier');
+  }
+
+  const tiers = body.tiers.map(t => ({
+    name:   String(t?.name ?? 'Tier'),
+    minRp:  Number(t?.minRp) || 0,
+    level:  Number(t?.level) || 1,
+    effect: String(t?.effect ?? '-'),
+    color:  /^#[0-9a-fA-F]{6}$/.test(String(t?.color)) ? String(t.color) : '#6b7194',
+  }));
+
+  const src = body.effectMinRp ?? {};
+  const effectMinRp = {
+    Nuke:      Number(src.Nuke)      || 0,
+    Hammer:    Number(src.Hammer)    || 0,
+    Blackhole: Number(src.Blackhole) || 0,
+  };
+
+  await env.DB.put(nsKey('tier_config', key, env), JSON.stringify({ tiers, effectMinRp }));
   return json({ ok: true });
 }
 
 export async function getConfig(env, key) {
   const raw = await env.DB.get(nsKey('tier_config', key, env));
-  return raw ? JSON.parse(raw) : DEFAULT_CONFIG;
+  if (!raw) return DEFAULT_CONFIG;
+  try {
+    const cfg = JSON.parse(raw);
+    // Fall back rather than hand a malformed tier list to levelForAmount —
+    // stored configs predate the validation above.
+    if (!Array.isArray(cfg?.tiers) || cfg.tiers.length === 0) return DEFAULT_CONFIG;
+    return { ...DEFAULT_CONFIG, ...cfg };
+  } catch {
+    return DEFAULT_CONFIG;
+  }
 }
 
-function levelForAmount(amount, tiers) {
-  const sorted = [...tiers].sort((a, b) => b.minRp - a.minRp);
+export function levelForAmount(amount, tiers) {
+  if (!Array.isArray(tiers)) return 0;
+  const sorted = [...tiers].sort((a, b) => (Number(b.minRp) || 0) - (Number(a.minRp) || 0));
   for (const t of sorted) {
-    if (amount >= t.minRp) return t.level || 1;
+    if (amount >= (Number(t.minRp) || 0)) return Number(t.level) || 1;
   }
   return 0;
 }
 
-// ── Leaderboard helper ─────────────────────────────────────────────────
-export async function updateLeaderboard(env, donations, key) {
-  const totals = {};
-  for (const d of donations) {
-    totals[d.donor_name] = (totals[d.donor_name] || 0) + (Number(d.amount) || 0);
-  }
-  const lb = Object.entries(totals)
-    .map(([donor_name, total_amount]) => ({ donor_name, total_amount }))
-    .sort((a, b) => b.total_amount - a.total_amount)
-    .slice(0, 20);
-  await env.DB.put(nsKey('leaderboard', key, env), JSON.stringify(lb));
-}
