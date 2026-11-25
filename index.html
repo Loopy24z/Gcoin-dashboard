@@ -386,7 +386,8 @@
 
 <script>
 // ── Constants ──────────────────────────────────────────────────────────
-const DEFAULT_URL = 'https://sw-dashboard-mocha.vercel.app';
+const DEFAULT_URL = 'https://gcoin-api.verifmlbb629.workers.dev';
+const LEGACY_PROXY_URL = 'https://sw-dashboard-mocha.vercel.app';
 
 // ── Auth ───────────────────────────────────────────────────────────────
 function getSession() {
@@ -452,7 +453,8 @@ function doLogout() {
 
 // ── Config ─────────────────────────────────────────────────────────────
 function getWorkerUrl() {
-  return (localStorage.getItem('gcoin_url') || DEFAULT_URL).replace(/\/$/, '');
+  const saved = (localStorage.getItem('gcoin_url') || '').trim().replace(/\/+$/, '');
+  return !saved || saved === LEGACY_PROXY_URL ? DEFAULT_URL : saved;
 }
 
 function saveCfg() {
